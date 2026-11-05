@@ -91,26 +91,14 @@ def build_spans(voices: list[list[VideoNote]], total_sec: float, fps: int,
             spans.append(Span(f, g - f, None))
         else:
             note = voices[owner_voice[f]][owner_note[f]]
-            # A clip that takes over mid-note starts from the matching point inside the segment.
-            offset = max(0.0, f / fps - note.start_sec)
+            # Starting a note is a retrigger: begin at the segment head on the quantized frame.
+            # If a higher-priority note covers the start and this clip takes over later, keep
+            # the source in sync by starting at the matching point inside the segment.
+            note_frame = round(note.start_sec * fps)
+            offset = 0.0 if f == note_frame else max(0.0, f / fps - note.start_sec)
             spans.append(Span(f, g - f, note.video_ref, note.seg_start + offset))
         f = g
-    return _merge_repeats(spans)
-
-
-def _merge_repeats(spans: list[Span]) -> list[Span]:
-    """Notes that reuse the same segment play on instead of restarting it: without this a part that
-    picks one segment over and over (drums do) shows the same few frames again and again, which
-    looks like a frozen picture."""
-    merged: list[Span] = []
-    for span in spans:
-        last = merged[-1] if merged else None
-        if (last is not None and last.video_ref == span.video_ref
-                and (span.video_ref is None or abs(last.source_start - span.source_start) < 0.02)):
-            last.frames += span.frames
-        else:
-            merged.append(Span(span.first_frame, span.frames, span.video_ref, span.source_start))
-    return merged
+    return spans
 
 
 def _merge_empty(spans: list[Span]) -> list[Span]:

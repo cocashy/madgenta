@@ -106,14 +106,19 @@ def test_pick_key_color_avoids_colours_in_the_material():
     assert pick_key_color(np.zeros((0, 8, 8, 3), np.uint8)) == "magenta"   # no material: a default
 
 
-def test_repeated_segment_plays_on_instead_of_restarting():
+def test_repeated_segment_restarts_from_the_beginning():
     from madgen.video import VideoNote, build_spans
 
     # Four notes in a row that all picked the same segment (drums do this).
     same = [VideoNote(i * 1.0, 1.0, "src.mp4", 100.0) for i in range(4)]
     spans = build_spans([same], 4.0, fps=30)
-    assert len(spans) == 1                      # one continuous span, not four restarts
-    assert spans[0].frames == 120 and spans[0].source_start == 100.0
+    assert len(spans) == 4                      # each note is a separate playback from the start
+    assert all(s.frames == 30 and s.source_start == 100.0 for s in spans)
+
+    # A start rounded up to the next frame still begins at the exact segment head.
+    quantized = build_spans([[VideoNote(0.02, 0.1, "src.mp4", 100.0)]], 0.2, fps=30)
+    assert quantized[0].first_frame == 1
+    assert quantized[0].source_start == 100.0
 
     # Different segments still get their own spans.
     varied = [VideoNote(i * 1.0, 1.0, "src.mp4", 100.0 + i) for i in range(3)]
