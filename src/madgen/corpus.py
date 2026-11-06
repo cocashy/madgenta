@@ -140,6 +140,7 @@ def segment_frames(f0: np.ndarray, rms_db: np.ndarray, p: SegmentParams) -> list
 
 
 PHONEME_ANALYZERS = ("wav2vec2",)
+PHONEME_ANALYZER_VERSION = "wav2vec2-v2-core"
 
 
 def _add_phoneme_segments(conn, digest: str, path: Path, wav16: Path, video_ref: str | None,
@@ -155,15 +156,17 @@ def _add_phoneme_segments(conn, digest: str, path: Path, wav16: Path, video_ref:
     for seg in segs:
         cur = conn.execute(
             "INSERT INTO segments (source_id, start_sec, end_sec, phoneme, f0_hz, video_ref, f0_std_cents, rms_db, "
-            "kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'phoneme')",
-            (digest, seg.start_sec, seg.end_sec, seg.phoneme, seg.f0_hz, video_ref, seg.f0_std_cents, seg.rms_db),
+            "core_start_sec, core_end_sec, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'phoneme')",
+            (digest, seg.start_sec, seg.end_sec, seg.phoneme, seg.f0_hz, video_ref, seg.f0_std_cents,
+             seg.rms_db, seg.core_start_sec, seg.core_end_sec),
         )
         conn.executemany(
             "INSERT INTO phoneme_candidates (segment_id, rank, phoneme, confidence) VALUES (?, ?, ?, ?)",
             [(cur.lastrowid, rank, ph, conf) for rank, (ph, conf) in enumerate(seg.candidates, 1)],
         )
-    conn.execute("UPDATE sources SET phonemes_analyzer = ? WHERE source_id = ?", ("wav2vec2", digest))
+    conn.execute("UPDATE sources SET phonemes_analyzer = ? WHERE source_id = ?",
+                 (PHONEME_ANALYZER_VERSION, digest))
     conn.commit()
     print(f"  {len(segs)} phoneme segments", file=sys.stderr)
     progress.log(f"{path}: {len(segs)} phoneme segments")
@@ -188,11 +191,11 @@ def build_corpus(sources: list[Path], db_path: Path, workers: int | None = None,
                            (digest,)).fetchone()
         if row:
             has_video, analyzed = row
-            if phonemes == "none" or analyzed == phonemes:
+            if phonemes == "none" or analyzed == PHONEME_ANALYZER_VERSION:
                 print("  unchanged, skipping (cached)", file=sys.stderr)
                 continue
-            # Pitch analysis is cached; only the phoneme analysis is missing.
-            print("  pitch analysis cached; adding phoneme analysis", file=sys.stderr)
+            # Pitch analysis is cached; refresh phoneme analysis when its feature version changes.
+            print("  pitch analysis cached; updating phoneme analysis", file=sys.stderr)
             wav16 = cache_dir / f"{digest}.16k.wav"
             progress.stage("decoding audio (16 kHz)")
             ffmpeg.extract_audio(path, wav16, ANALYSIS_SR)

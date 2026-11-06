@@ -1,8 +1,7 @@
 """render: phases 2-4 wired together.
 
---melody (MIDI) tracks go through melody mode (phoneme-agnostic, pitch corpus);
---ust (UST/USTX) tracks go through lyrics mode (phoneme corpus). Both can be used at once:
-the MIDI then holds the accompaniment and the UST the sung parts.
+MIDI tracks use the pitch corpus by default, or the phoneme corpus with --melody-synth.
+UST/USTX tracks use the phoneme corpus. Both can be used at once.
 """
 
 from __future__ import annotations
@@ -29,9 +28,12 @@ from .match import (
     select_units_lyrics,
     select_units_percussion,
 )
+from .melody_synth import ATTACK_MAX_NOTE_RATIO, ATTACK_MAX_SEC, MelodySynthCandidate, build_candidates
+from .melody_synth import select_units as select_units_melody_synth
 from .phonemes import drum_for, is_voiced_sustained, parse_drum_materials
 from .progress import progress
-from .synth import SR, TARGET_RMS_DB, NoteJob, normalize_gain, render_voice, sum_tracks
+from .synth import (SR, TARGET_RMS_DB, NoteJob, normalize_gain, render_melody_synth_voice,
+                    render_voice, sum_tracks)
 from .target import Voice, hz_to_midi, load_midi
 from .video import (
     Layer,
@@ -321,6 +323,11 @@ def render(args: argparse.Namespace) -> None:
         raise NotImplementedError("--lyrics (plain dialogue text) is not implemented yet; use --ust for sung lyrics")
     if args.melody is None and args.ust is None:
         raise SystemExit("give --melody (MIDI), --ust (UST/USTX), or both")
+    melody_synth_enabled = getattr(args, "melody_synth", False)
+    if melody_synth_enabled and args.melody is None:
+        raise SystemExit("--melody-synth requires --melody")
+    if melody_synth_enabled and args.no_pitch_correct:
+        raise SystemExit("--melody-synth always corrects vowel pitch; omit --no-pitch-correct")
     for name in ("pitch_flatten", "lyrics_pitch_flatten"):
         if not 0.0 <= getattr(args, name) <= 1.0:
             raise SystemExit(f"--{name.replace('_', '-')} must be within 0..1")
@@ -344,18 +351,25 @@ def render(args: argparse.Namespace) -> None:
         voices += load_ust(args.ust, args.ust_tracks)
     drums = [v for v in voices if v.percussion] if args.percussion != "pitched" else []
     corpora = {}
-    if any(not v.lyrics for v in voices):
+    needs_pitch = any(not v.lyrics and (not melody_synth_enabled or v.percussion) for v in voices)
+    needs_synth_phonemes = melody_synth_enabled and any(
+        not v.lyrics and not v.percussion for v in voices
+    )
+    if needs_pitch:
         corpora["pitch"] = db.load_corpus(conn, "pitch")
-    if any(v.lyrics for v in voices) or (drums and args.percussion == "samples"):
+    if any(v.lyrics for v in voices) or needs_synth_phonemes or (drums and args.percussion == "samples"):
         try:
             corpora["phoneme"] = db.load_corpus(conn, "phoneme")
         except SystemExit:
-            if any(v.lyrics for v in voices):
+            if any(v.lyrics for v in voices) or needs_synth_phonemes:
                 raise
             # A drum track can only borrow phonemes if they have been analyzed; without them,
             # fall back to what earlier versions did (note numbers treated as pitches).
             print("  no phoneme corpus: percussion falls back to --percussion pitched", file=sys.stderr)
             drums = []
+    synth_candidates: list[MelodySynthCandidate] = []
+    if needs_synth_phonemes:
+        synth_candidates = build_candidates(corpora["phoneme"])
     total_sec = max(u.start_sec + u.duration_sec for v in voices for u in v.units) + TAIL_SEC
     sizes = ", ".join(f"{len(c)} {kind} segments" for kind, c in corpora.items())
     print(f"[render] corpus {sizes}, {len(voices)} voices, {total_sec:.1f} s", file=sys.stderr)
@@ -378,66 +392,157 @@ def render(args: argparse.Namespace) -> None:
                   f"{corpus.start[si]:.2f}-{corpus.end[si]:.2f}s", file=sys.stderr)
     for voice in voices:
         sampled_drums = voice in drums and args.percussion == "samples"
-        corpus = corpora["phoneme" if voice.lyrics or sampled_drums else "pitch"]
+        synth_voice = melody_synth_enabled and not voice.lyrics and not voice.percussion
+        corpus = corpora["phoneme" if voice.lyrics or sampled_drums or synth_voice else "pitch"]
         progress.stage(f"matching {voice.label} ({len(voice.units)} units)")
+        stretch_needed = np.zeros(len(voice.units), dtype=bool)
         if voice.lyrics:
             path = select_units_lyrics(voice.units, corpus, lyrics_weights)
         elif sampled_drums:
             path = select_units_percussion(voice.units, corpus, drum_samples, drum_materials)
+        elif synth_voice:
+            path, stretch_needed = select_units_melody_synth(voice.units, corpus, synth_candidates)
         else:
             path = select_units(voice.units, corpus, weights)
-        jobs, refs = [], []
-        for unit, si in zip(voice.units, path, strict=True):
-            sid = corpus.source_id[si]
-            sustained = not voice.lyrics or is_voiced_sustained(unit.phoneme)
-            drum = drum_for(hz_to_midi(unit.target_f0_hz)) if sampled_drums else None
-            job = NoteJob(
-                audio_path=corpus.audio_cache[sid],
-                seg_start=float(corpus.start[si]),
-                seg_end=float(corpus.end[si]),
-                seg_f0=float(corpus.f0[si]),
-                target_f0=unit.target_f0_hz,
-                note_start=unit.start_sec,
-                # A hit is as long as the instrument, not as long as the note.
-                note_dur=min(unit.duration_sec, drum.max_sec) if drum else unit.duration_sec,
-                velocity=unit.velocity,
-                flatten=args.lyrics_pitch_flatten if voice.lyrics else args.pitch_flatten,
-                # Consonants are left alone: their pitch is not what is heard.
-                # A drum hit keeps the material as it is: its pitch is not what is heard.
-                threshold_cents=None if drum else
-                ((lyrics_threshold if voice.lyrics else threshold) if sustained else None),
-                level_db=(TARGET_RMS_DB + drum.level_db) if drum else
-                (TARGET_RMS_DB if sustained else CONSONANT_LEVEL_DB),
-                measure_used_f0=voice.lyrics and sustained,
-                sustain_to_note=voice.lyrics and sustained and not args.no_lyrics_stretch,
-            )
-            jobs.append(job)
-            refs.append(corpus.video_ref[si])
-            entry = {
-                "voice": voice.label, "index": unit.index,
-                "note_start_sec": round(unit.start_sec, 4), "note_duration_sec": round(unit.duration_sec, 4),
-                "target_f0_hz": round(unit.target_f0_hz, 2),
-                "segment_id": int(corpus.ids[si]), "source": corpus.source_path[sid],
-                "start_sec": round(job.seg_start, 4), "end_sec": round(job.seg_end, 4),
-                "f0_hz": None if np.isnan(job.seg_f0) else round(job.seg_f0, 2),
-                "pitch_offset_cents": None,   # filled in after synthesis
-                "pitch_corrected": False,
-            }
-            if drum:
-                entry["instrument"] = drum.name
-            if voice.lyrics:
-                cands = [(str(p), round(float(c), 3))
-                         for p, c in zip(corpus.cand_phoneme[si], corpus.cand_conf[si], strict=True) if p]
-                rank = next((r + 1 for r, (p, _) in enumerate(cands) if p == unit.phoneme), None)
-                entry.update({"phoneme": unit.phoneme, "matched_rank": rank, "segment_candidates": cands})
+        jobs, refs, synth_groups = [], [], []
+        for unit_index, (unit, si) in enumerate(zip(voice.units, path, strict=True)):
+            if synth_voice:
+                candidate = synth_candidates[int(si)]
+                vowel_idx = candidate.vowel_idx
+                sid = corpus.source_id[vowel_idx]
+                core_start = float(corpus.core_start[vowel_idx])
+                core_end = float(corpus.core_end[vowel_idx])
+                attack_dur = 0.0
+                attack_job = None
+                if candidate.onset_idx is not None:
+                    onset_idx = candidate.onset_idx
+                    attack_dur = min(float(corpus.end[onset_idx] - corpus.start[onset_idx]),
+                                     ATTACK_MAX_SEC, unit.duration_sec * ATTACK_MAX_NOTE_RATIO)
+                    if attack_dur > 0:
+                        attack_job = NoteJob(
+                            audio_path=corpus.audio_cache[sid],
+                            seg_start=float(corpus.start[onset_idx]),
+                            seg_end=float(corpus.start[onset_idx] + attack_dur),
+                            seg_f0=float(corpus.f0[onset_idx]),
+                            target_f0=unit.target_f0_hz,
+                            note_start=unit.start_sec,
+                            note_dur=attack_dur,
+                            velocity=unit.velocity,
+                            flatten=1.0,
+                            threshold_cents=None,
+                            level_db=CONSONANT_LEVEL_DB,
+                        )
+                vowel_dur = max(0.001, unit.duration_sec - attack_dur)
+                vowel_job = NoteJob(
+                    audio_path=corpus.audio_cache[sid],
+                    seg_start=core_start,
+                    seg_end=core_end,
+                    seg_f0=float(corpus.f0[vowel_idx]),
+                    target_f0=unit.target_f0_hz,
+                    note_start=unit.start_sec + attack_dur,
+                    note_dur=vowel_dur,
+                    velocity=unit.velocity,
+                    flatten=1.0,
+                    threshold_cents=0.0,
+                    level_db=TARGET_RMS_DB,
+                    measure_used_f0=True,
+                    sustain_to_note=bool(stretch_needed[unit_index]),
+                    force_pitch_correction=True,
+                )
+                synth_groups.append((attack_job, vowel_job))
+                material_start = (float(corpus.start[candidate.onset_idx])
+                                  if candidate.onset_idx is not None else core_start)
+                rep_job = NoteJob(
+                    audio_path=corpus.audio_cache[sid],
+                    seg_start=material_start,
+                    seg_end=core_end,
+                    seg_f0=float(corpus.f0[vowel_idx]),
+                    target_f0=unit.target_f0_hz,
+                    note_start=unit.start_sec,
+                    note_dur=unit.duration_sec,
+                    velocity=unit.velocity,
+                    flatten=1.0,
+                    threshold_cents=0.0,
+                    measure_used_f0=True,
+                    sustain_to_note=bool(stretch_needed[unit_index]),
+                )
+                jobs.append(rep_job)
+                refs.append(corpus.video_ref[vowel_idx])
+                entry = {
+                    "voice": voice.label, "index": unit.index,
+                    "note_start_sec": round(unit.start_sec, 4),
+                    "note_duration_sec": round(unit.duration_sec, 4),
+                    "target_f0_hz": round(unit.target_f0_hz, 2),
+                    "segment_id": int(corpus.ids[vowel_idx]),
+                    "source": corpus.source_path[sid],
+                    "start_sec": round(material_start, 4), "end_sec": round(core_end, 4),
+                    "f0_hz": round(float(corpus.f0[vowel_idx]), 2),
+                    "pitch_offset_cents": None,
+                    "pitch_corrected": False,
+                    "melody_synth": True,
+                    "vowel": candidate.vowel_phoneme,
+                    "core_duration_sec": round(core_end - core_start, 4),
+                    "onset_duration_sec": round(attack_dur, 4),
+                    "stretch_fallback": bool(stretch_needed[unit_index]),
+                }
+                if candidate.onset_idx is not None:
+                    entry["onset_segment_id"] = int(corpus.ids[candidate.onset_idx])
+                    entry["onset_phoneme"] = str(corpus.phoneme[candidate.onset_idx])
+            else:
+                sid = corpus.source_id[si]
+                sustained = not voice.lyrics or is_voiced_sustained(unit.phoneme)
+                drum = drum_for(hz_to_midi(unit.target_f0_hz)) if sampled_drums else None
+                job = NoteJob(
+                    audio_path=corpus.audio_cache[sid],
+                    seg_start=float(corpus.start[si]),
+                    seg_end=float(corpus.end[si]),
+                    seg_f0=float(corpus.f0[si]),
+                    target_f0=unit.target_f0_hz,
+                    note_start=unit.start_sec,
+                    # A hit is as long as the instrument, not as long as the note.
+                    note_dur=min(unit.duration_sec, drum.max_sec) if drum else unit.duration_sec,
+                    velocity=unit.velocity,
+                    flatten=args.lyrics_pitch_flatten if voice.lyrics else args.pitch_flatten,
+                    # Consonants are left alone: their pitch is not what is heard.
+                    # A drum hit keeps the material as it is: its pitch is not what is heard.
+                    threshold_cents=None if drum else
+                    ((lyrics_threshold if voice.lyrics else threshold) if sustained else None),
+                    level_db=(TARGET_RMS_DB + drum.level_db) if drum else
+                    (TARGET_RMS_DB if sustained else CONSONANT_LEVEL_DB),
+                    measure_used_f0=voice.lyrics and sustained,
+                    sustain_to_note=voice.lyrics and sustained and not args.no_lyrics_stretch,
+                )
+                jobs.append(job)
+                refs.append(corpus.video_ref[si])
+                entry = {
+                    "voice": voice.label, "index": unit.index,
+                    "note_start_sec": round(unit.start_sec, 4), "note_duration_sec": round(unit.duration_sec, 4),
+                    "target_f0_hz": round(unit.target_f0_hz, 2),
+                    "segment_id": int(corpus.ids[si]), "source": corpus.source_path[sid],
+                    "start_sec": round(job.seg_start, 4), "end_sec": round(job.seg_end, 4),
+                    "f0_hz": None if np.isnan(job.seg_f0) else round(job.seg_f0, 2),
+                    "pitch_offset_cents": None,   # filled in after synthesis
+                    "pitch_corrected": False,
+                }
+                if drum:
+                    entry["instrument"] = drum.name
+                if voice.lyrics:
+                    cands = [(str(p), round(float(c), 3))
+                             for p, c in zip(corpus.cand_phoneme[si], corpus.cand_conf[si], strict=True) if p]
+                    rank = next((r + 1 for r, (p, _) in enumerate(cands) if p == unit.phoneme), None)
+                    entry.update({"phoneme": unit.phoneme, "matched_rank": rank, "segment_candidates": cands})
             plan.append(entry)
         print(f"  synthesizing {voice.label} ({len(jobs)} {'phonemes' if voice.lyrics else 'notes'})",
               file=sys.stderr)
-        progress.stage(f"synthesizing {voice.label}", len(jobs))
+        render_count = (sum(1 + (attack is not None) for attack, _ in synth_groups)
+                        if synth_voice else len(jobs))
+        progress.stage(f"synthesizing {voice.label}", render_count)
         if voice in drums and args.percussion == "off":
             # Silent, but the segments are still chosen so the video can follow the track.
             audio = np.zeros(int(total_sec * SR) + 1, dtype=np.float32)
             synth_info = [(job.seg_f0, False, 1.0) for job in jobs]
+        elif synth_voice:
+            audio, synth_info = render_melody_synth_voice(synth_groups, total_sec, args.workers)
         else:
             audio, synth_info = render_voice(jobs, total_sec, args.workers)
         for entry, job, (ref_f0, is_corrected, ratio) in zip(plan[len(plan) - len(jobs):], jobs, synth_info,
@@ -448,13 +553,14 @@ def render(args: argparse.Namespace) -> None:
             entry["pitch_corrected"] = bool(is_corrected)
             if job.measure_used_f0:
                 entry["used_f0_hz"] = None if np.isnan(ref_f0) else round(ref_f0, 2)
-            if voice.lyrics:
+            if voice.lyrics or synth_voice:
                 entry["stretch_ratio"] = round(ratio, 2)
         if voice.gain != 1.0:
             audio = audio * np.float32(voice.gain)
         rendered.append(RenderedVoice(voice, audio, _video_notes(voice, jobs, refs)))
-    print(f"  pitch corrected {corrected}/{len(plan)} units "
-          f"({'off' if threshold is None else f'threshold {threshold:g} cents'})", file=sys.stderr)
+    correction_mode = ("melody synth forces flat target pitch; " if melody_synth_enabled else "")
+    correction_mode += "off" if threshold is None else f"threshold {threshold:g} cents"
+    print(f"  pitch corrected {corrected}/{len(plan)} units ({correction_mode})", file=sys.stderr)
     if any(v.lyrics for v in voices) and lyrics_threshold is not None:
         print(f"  lyrics: pitch threshold {lyrics_threshold:g} cents, flatten {args.lyrics_pitch_flatten:g}",
               file=sys.stderr)

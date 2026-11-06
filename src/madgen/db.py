@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS segments (
     video_ref TEXT,               -- path of the source video, NULL for audio-only sources
     f0_std_cents REAL NOT NULL,   -- pitch stability within the segment
     rms_db REAL NOT NULL,         -- mean loudness (dBFS)
-    kind TEXT NOT NULL DEFAULT 'pitch'  -- 'pitch' (melody mode) | 'phoneme' (lyrics mode)
+    core_start_sec REAL,          -- sustained voiced core for phoneme candidates
+    core_end_sec REAL,
+    kind TEXT NOT NULL DEFAULT 'pitch'  -- 'pitch' (ordinary melody) | 'phoneme' (lyrics / melody synth)
 );
 CREATE TABLE IF NOT EXISTS phoneme_candidates (
     segment_id INTEGER NOT NULL,
@@ -42,6 +44,8 @@ CREATE TABLE IF NOT EXISTS sources (
 # Columns added after the first release, for DBs created before them.
 _MIGRATIONS = [
     ("segments", "kind", "TEXT NOT NULL DEFAULT 'pitch'"),
+    ("segments", "core_start_sec", "REAL"),
+    ("segments", "core_end_sec", "REAL"),
     ("sources", "phonemes_analyzer", "TEXT"),
 ]
 
@@ -76,7 +80,9 @@ class Corpus:
     next_idx: np.ndarray
     audio_cache: dict[str, str]
     source_path: dict[str, str]
-    # Lyrics mode only: top-3 phoneme candidates per segment ('' = none) and their confidences.
+    core_start: np.ndarray | None = None
+    core_end: np.ndarray | None = None
+    # Phoneme-based modes: top-3 candidates per segment ('' = none) and their confidences.
     cand_phoneme: np.ndarray | None = None
     cand_conf: np.ndarray | None = None
 
@@ -86,7 +92,8 @@ class Corpus:
 
 def load_corpus(conn: sqlite3.Connection, kind: str = "pitch") -> Corpus:
     rows = conn.execute(
-        "SELECT id, source_id, start_sec, end_sec, phoneme, f0_hz, f0_std_cents, rms_db, video_ref "
+        "SELECT id, source_id, start_sec, end_sec, phoneme, f0_hz, f0_std_cents, rms_db, "
+        "core_start_sec, core_end_sec, video_ref "
         "FROM segments WHERE kind = ? ORDER BY source_id, start_sec",
         (kind,),
     ).fetchall()
@@ -94,7 +101,7 @@ def load_corpus(conn: sqlite3.Connection, kind: str = "pitch") -> Corpus:
         if kind == "phoneme":
             raise SystemExit("corpus has no phoneme analysis: run `madgen build-corpus --phonemes wav2vec2` first")
         raise SystemExit("corpus is empty: run `madgen build-corpus` first")
-    ids, sid, st, en, ph, f0, sd, rms, vref = zip(*rows, strict=True)
+    ids, sid, st, en, ph, f0, sd, rms, core_st, core_en, vref = zip(*rows, strict=True)
     start = np.asarray(st, dtype=np.float64)
     end = np.asarray(en, dtype=np.float64)
     source_id = np.asarray(sid)
@@ -129,6 +136,8 @@ def load_corpus(conn: sqlite3.Connection, kind: str = "pitch") -> Corpus:
         next_idx=next_idx,
         audio_cache={s: a for s, a, _ in sources},
         source_path={s: p for s, _, p in sources},
+        core_start=np.asarray([np.nan if v is None else v for v in core_st], dtype=np.float64),
+        core_end=np.asarray([np.nan if v is None else v for v in core_en], dtype=np.float64),
         cand_phoneme=cand_phoneme,
         cand_conf=cand_conf,
     )

@@ -1,4 +1,4 @@
-"""Phase 1 (lyrics mode): phoneme segments with top-3 candidates and confidences.
+"""Phase 1 (lyrics and melody synth modes): phoneme segments with top-3 candidates and confidences.
 
 1. whisperX (large-v3) transcribes the source into timed utterances.
 2. pyopenjtalk turns each utterance's text into phonemes.
@@ -12,8 +12,8 @@ Silence rules (as in melody mode): segments below the silence level are dropped,
 segments that are mostly unvoiced (breath, whisper) are dropped too. Utterances whose alignment
 is implausible (typically whisper hallucinating on music or noise) are skipped as a whole.
 
-Needs the `lyrics` extra (torch, whisperX, pyopenjtalk). Imports are local so melody mode never
-loads any of it.
+Needs the `lyrics` extra (torch, whisperX, pyopenjtalk). Imports are local so ordinary melody mode
+never loads any of it.
 """
 
 from __future__ import annotations
@@ -35,8 +35,12 @@ WHISPER_MODEL = "large-v3"
 PHONEME_MODEL = "facebook/wav2vec2-xlsr-53-espeak-cv-ft"
 PAD_SEC = 0.15                 # context around each utterance
 MIN_ALIGN_PROB = 0.02          # geometric-mean token probability below which an utterance is skipped
-MAX_SEG_SEC = {"vowel": 1.2, "consonant": 0.25}
+MAX_SEG_SEC = {"vowel": 5.0, "consonant": 0.25}
 MIN_VOICED_RATIO = 0.3         # sustained phonemes need at least this share of voiced frames
+FRAME_PERIOD_MS = 5.0
+CORE_RANGE_DB = 12.0
+CORE_MAX_GAP_FRAMES = 2
+CORE_MIN_FRAMES = 4
 
 # pyopenjtalk phoneme -> IPA tokens of the phoneme model. The first token is the alignment target;
 # all of them count toward the phoneme's posterior mass.
@@ -62,6 +66,8 @@ class PhonemeSegment:
     f0_hz: float | None
     f0_std_cents: float
     rms_db: float
+    core_start_sec: float | None = None
+    core_end_sec: float | None = None
 
 
 def _log(msg: str) -> None:
@@ -150,6 +156,37 @@ def _g2p(text: str) -> list[str]:
     return out
 
 
+def _frame_rms_db(audio: np.ndarray, n_frames: int) -> np.ndarray:
+    """RMS per WORLD frame, using the same 5 ms grid as the F0 track."""
+    hop = int(SR * FRAME_PERIOD_MS / 1000)
+    win = hop * 4
+    padded = np.pad(audio.astype(np.float64), (win // 2, win))
+    idx = np.arange(n_frames)[:, None] * hop + np.arange(win)[None, :]
+    rms = np.sqrt(np.mean(padded[idx] ** 2, axis=1) + 1e-12)
+    return 20 * np.log10(rms)
+
+
+def _longest_run(mask: np.ndarray, max_gap: int) -> tuple[int, int]:
+    """Return the longest [start, end) run, bridging short gaps."""
+    best = (0, 0)
+    start: int | None = None
+    gap = 0
+    end = 0
+    for i, keep in enumerate(np.append(mask, False)):
+        if keep:
+            if start is None:
+                start = i
+            gap = 0
+            end = i + 1
+            if end - start > best[1] - best[0]:
+                best = (start, end)
+        elif start is not None:
+            gap += 1
+            if gap > max_gap or i == len(mask):
+                start, gap = None, 0
+    return best
+
+
 def analyze(audio: np.ndarray, device: str | None = None,
             model_name: str = WHISPER_MODEL) -> list[PhonemeSegment]:
     import torch
@@ -187,6 +224,7 @@ def analyze(audio: np.ndarray, device: str | None = None,
         x = chunk.astype(np.float64)
         f0, f0_t = pyworld.dio(x, SR, frame_period=5.0, f0_floor=60.0, f0_ceil=1100.0)
         f0 = pyworld.stonemask(x, f0, f0_t, SR)
+        frame_rms = _frame_rms_db(x, len(f0))
 
         for pi, (ph, (s, e, _)) in enumerate(zip(phonemes, spans, strict=True)):
             # A phoneme lasts from its first frame to the next phoneme's first frame, capped.
@@ -201,7 +239,10 @@ def analyze(audio: np.ndarray, device: str | None = None,
             cands = [(INVENTORY[j], round(float(c), 4)) for j, c in zip(order, conf, strict=True)]
 
             t0, t1 = s * frame_sec, end * frame_sec
-            seg_f0 = f0[int(t0 * 200): max(int(t0 * 200) + 1, int(t1 * 200))]
+            frame_a = max(0, int(np.searchsorted(f0_t, t0, side="left")))
+            frame_b = min(len(f0), max(frame_a + 1, int(np.searchsorted(f0_t, t1, side="left"))))
+            seg_f0 = f0[frame_a:frame_b]
+            seg_rms = frame_rms[frame_a:frame_b]
             voiced = seg_f0[seg_f0 > 0]
             samples = x[int(t0 * SR): int(t1 * SR)]
             rms = 20 * np.log10(np.sqrt(np.mean(samples ** 2)) + 1e-12) if samples.size else -120.0
@@ -211,7 +252,17 @@ def analyze(audio: np.ndarray, device: str | None = None,
                 std = float(np.std(1200 * np.log2(voiced / med)))
             else:
                 med, std = None, 0.0
-            raw.append((PhonemeSegment(a0 / SR + t0, a0 / SR + t1, cands[0][0], cands, med, std, float(rms)),
+            core_start = core_end = None
+            if is_voiced_sustained(ph) and seg_f0.size:
+                loud_frames = seg_rms > float(np.max(seg_rms)) - CORE_RANGE_DB
+                core_a, core_b = _longest_run((seg_f0 > 0) & loud_frames, CORE_MAX_GAP_FRAMES)
+                if core_b - core_a >= CORE_MIN_FRAMES:
+                    seg_start_abs, seg_end_abs = a0 / SR + t0, a0 / SR + t1
+                    core_start = max(seg_start_abs, a0 / SR + float(f0_t[frame_a + core_a]))
+                    core_end = min(seg_end_abs,
+                                   a0 / SR + float(f0_t[frame_a + core_b - 1]) + FRAME_PERIOD_MS / 1000)
+            raw.append((PhonemeSegment(a0 / SR + t0, a0 / SR + t1, cands[0][0], cands, med, std,
+                                       float(rms), core_start, core_end),
                         ph, voiced_ratio))
             all_rms.append(rms)
         progress.update(ui + 1)

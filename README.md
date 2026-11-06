@@ -2,11 +2,11 @@
 
 target と source（音声/動画、複数可）を渡すと、source の断片を自動で選んで切り貼りし、target を再現した音声/動画を生成します。Unit Selection TTS と同じ方式（候補の絞り込み → Viterbi DP）です。
 
-モードは2つあり、1回のレンダリングで併用できます。
+target のモードは2つあり、1回のレンダリングで併用できます。MIDI のメロディモードは、通常のピッチ素材選択と `--melody-synth` による母音素材選択を切り替えられます。
 
 | モード | target | 素材の選び方 |
 | --- | --- | --- |
-| メロディモード | `--melody` の MIDI | 音高の近さ（音素は気にしない） |
+| メロディモード | `--melody` の MIDI | 通常は音高の近さで選択。`--melody-synth` では長い母音を選び、子音の頭を残して母音を目標音高に補正 |
 | 歌詞モード | `--ust` の UST / USTX | 音素の一致を最優先し、次にピッチと長さ、最後に接続の自然さ（辞書式）。自然さより、UST の音程と長さを忠実に再現することを優先 |
 
 ## インストール
@@ -144,6 +144,7 @@ uv run --extra lyrics --extra cpu madgen build-corpus --source sources/ --db wor
 | オプション | 既定値 | 内容 |
 | --- | --- | --- |
 | `--melody FILE.mid` | — | メロディモードで作る MIDI（`--ust` と併用する場合は伴奏） |
+| `--melody-synth` | オフ | MIDI のメロディ素材を、音素コーパス内の長い母音から選ぶ。短い子音の頭を原音で残し、母音はノート音高に平坦化。足りる母音がない音符だけ WORLD で伸長（`--melody` と `--phonemes wav2vec2` が必要。`auto` は音素解析を自動実行） |
 | `--ust FILE.ust(x)` | — | 歌詞モードで作る UST / USTX |
 | `--tracks` | ノートがある全トラック | 使う MIDI トラックの名前か番号（カンマ区切り） |
 | `--ust-tracks` | ミュートされていない全トラック | 使う UST/USTX トラックの名前か番号（カンマ区切り） |
@@ -158,11 +159,11 @@ uv run --extra lyrics --extra cpu madgen build-corpus --source sources/ --db wor
 | `--layer TRACK=ROLE` | 自動 | トラックをレイヤーに割り当てる（複数指定可）。ROLE は `background` / `panel` / `lead` |
 | `--chroma-key` | `auto` | 何も映っていない部分の色。`auto` = 素材に最も含まれない色を自動選択、`off` = 黒、または `magenta` / `green` / `blue` / `cyan` |
 | `--video-track` | 最長の UST トラック → 名前に "main" を含む MIDI トラック → 最長の MIDI トラック | `fullscreen` のとき優先するトラック（名前、MIDI の番号、UST は `ust0` のように指定） |
-| `--pitch-threshold CENTS` | 25 | メロディモード: 素材の音高がこれ以上ずれている音符だけピッチ補正する。0 = すべて補正 |
-| `--pitch-flatten` | 0.6 | メロディモード: 補正する音符で、0 = 素材の抑揚をそのまま残す、1 = ノートの音高で平坦にする |
+| `--pitch-threshold CENTS` | 25 | 通常のメロディモード: 素材の音高がこれ以上ずれている音符だけピッチ補正する。0 = すべて補正。`--melody-synth` は常に補正 |
+| `--pitch-flatten` | 0.6 | 通常のメロディモード: 補正する音符で、0 = 素材の抑揚をそのまま残す、1 = ノートの音高で平坦にする。`--melody-synth` は常に平坦化 |
 | `--lyrics-pitch-threshold CENTS` | 0 | 歌詞モードの母音・「ん」について同上（既定はすべて補正） |
 | `--lyrics-pitch-flatten` | 1.0 | 歌詞モードの母音・「ん」について同上（既定はノートの音高で平坦） |
-| `--no-pitch-correct` | オフ | どちらのモードでもピッチ補正を一切しない（マッチングで音高が合う素材を強く優先） |
+| `--no-pitch-correct` | オフ | 通常のメロディ／歌詞モードでピッチ補正をしない（`--melody-synth` とは併用不可） |
 | `--no-lyrics-stretch` | オフ | 歌詞モードで、母音の芯を取り出してノートの長さに合わせる処理をせず、素材をそのまま使う（ノートより短ければ残りは無音） |
 | `--vocal-boost DB` | 2 | `--ust` と `--melody` の併用時、歌トラック全体を伴奏よりこの dB だけ大きくそろえる |
 | `--no-auto-balance` | オフ | 上の自動調整をしない |
@@ -182,12 +183,34 @@ uv run --extra lyrics --extra cpu madgen build-corpus --source sources/ --db wor
 | --- | --- | --- |
 | `--source PATH` | — | 素材のファイルかフォルダ（複数指定可）。音声・動画の主な形式に対応 |
 | `--db FILE` | — | 素材 DB（SQLite）。解析済みの音声は `DB名.cache/` に置かれる |
-| `--phonemes wav2vec2` | `none` | 歌詞モード用の音素解析も行う（lyrics extra が必要） |
+| `--phonemes wav2vec2` | `none` | 歌詞モード／メロディシンセモード用の音素解析も行う（lyrics extra が必要） |
 | `--device` | `auto` | 音素解析を動かす場所。`auto`（GPU があれば GPU）/ `cuda` / `cpu` |
 | `--workers N` | CPU コア数 − 2 | 音高解析の並列数 |
 | `--log FILE` | `DB名.log` | 進捗ログ |
 
 同じ内容のファイル（ハッシュで判定）は二度解析しません。同じパスで内容が変わったファイルは、古い解析結果を消して解析し直します。
+
+## メロディシンセモード
+
+`--melody-synth` は、指定した MIDI の非打楽器トラックに適用します。音素解析済みコーパスから母音の芯を探し、目標ノートを鳴らしきれる素材があれば時間伸長せずに使います。直前の子音があれば最大60ms（短いノートではノート長の40%まで）だけ原音で残し、母音は目標音高に平坦化します。十分な長さの母音がないノートに限り、WORLD で伸長します。
+
+音素コーパスがまだない場合は、先に追加します。音素解析の更新後は、既存の音高解析を保ったまま音素情報だけを再計算します。
+
+```sh
+uv run --extra lyrics --extra cu128 madgen build-corpus \
+  --source sources/ --db work/corpus.sqlite --phonemes wav2vec2
+uv run --extra lyrics --extra cu128 madgen render --db work/corpus.sqlite \
+  --melody target/target.mid --melody-synth --out-dir work/out
+```
+
+`auto` では `--melody-synth` を指定すると音素解析も自動で行います。
+
+```sh
+uv run --extra lyrics --extra cu128 madgen auto --source sources/ --db work/corpus.sqlite \
+  --melody target/target.mid --melody-synth --out-dir work/out
+```
+
+`plan.json` には選んだ母音、子音の有無と長さ、母音の芯の長さ、ピッチ補正量、伸長倍率が記録されます。`--no-pitch-correct` とは併用できません。
 
 ## 歌詞モードの詳細
 

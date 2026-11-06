@@ -3,14 +3,16 @@
 Silence rules:
 - A rest in the target stays silent: nothing is ever placed outside a note's own span
   (except the short fade-out tail that doubles as the crossfade into a legato neighbour).
-- A segment shorter than its note is not stretched or looped: the remainder of the note is silence.
+- In ordinary melody mode a segment shorter than its note is not stretched or looped: the remainder
+  of the note is silence.
 
-Lyrics mode instead reproduces the note faithfully for sustained units (vowel / N): it takes the
+Lyrics mode and melody synth fallback reproduce sustained units (vowel / N): they take the
 *core* of the segment -- the longest run of frames that are voiced and within CORE_RANGE_DB of the
 segment's loudest frame, i.e. the vowel body without its decay, breath or silence -- and fits it to
 exactly the note length: cut when longer, time-stretched when shorter (WORLD frames resampled,
-STRETCH_EDGE_SEC kept as is at each end). Unvoiced frames inside the core are given a pitch, so
-the whole note sounds.
+STRETCH_EDGE_SEC kept as is at each end). In melody synth mode the native vowel core is cropped
+without stretching whenever it is long enough; only a shortfall uses this fallback. Unvoiced frames
+inside a lyrics core are given a pitch, so the whole note sounds.
 
 Pitch correction: a segment is resynthesized at the note's pitch only when its own pitch is off
 by more than `threshold_cents`; otherwise the original audio is used untouched.
@@ -64,6 +66,8 @@ class NoteJob:
     measure_used_f0: bool = False
     # Lyrics mode: fit the segment's voiced core to exactly the note length (see module docstring).
     sustain_to_note: bool = False
+    # Melody synth mode: flatten the voiced material even when its median already matches.
+    force_pitch_correction: bool = False
 
 
 def needs_correction(seg_f0: float, target_f0: float, threshold_cents: float | None) -> bool:
@@ -151,7 +155,7 @@ def _render_sustained(job: NoteJob, x: np.ndarray, offset: int) -> tuple[np.ndar
 
     voiced_core = f0[core][f0[core] > 0]
     ref_f0 = float(np.median(voiced_core)) if voiced_core.size >= 3 else float("nan")
-    corrected = needs_correction(ref_f0, job.target_f0, job.threshold_cents)
+    corrected = job.force_pitch_correction or needs_correction(ref_f0, job.target_f0, job.threshold_cents)
 
     sp = pyworld.cheaptrick(x, f0, t, SR)[core]
     ap = pyworld.d4c(x, f0, t, SR)[core]
@@ -161,9 +165,9 @@ def _render_sustained(job: NoteJob, x: np.ndarray, offset: int) -> tuple[np.ndar
     limit = 10 ** (SUSTAIN_LEVEL_RANGE_DB / 10)
     sp = sp * np.clip(np.median(energy) / energy, 1 / limit, limit)[:, None]
     core_f0 = _fill_unvoiced(f0[core])
-    if corrected:
+    if corrected and np.isfinite(ref_f0):
         core_f0 = job.target_f0 * (core_f0 / ref_f0) ** (1.0 - job.flatten)
-    elif np.isnan(ref_f0) and job.threshold_cents is not None:
+    elif np.isnan(ref_f0) and (job.threshold_cents is not None or job.force_pitch_correction):
         core_f0 = np.full(len(core_f0), job.target_f0)  # no pitch in the material at all: give it the note's
         corrected = True
 
@@ -214,7 +218,7 @@ def render_note(job: NoteJob) -> tuple[int, np.ndarray, float, bool, float]:
         voiced_used = used[used > 0]
         ref_f0 = float(np.median(voiced_used)) if voiced_used.size >= 3 else float("nan")
 
-    corrected = needs_correction(ref_f0, job.target_f0, job.threshold_cents)
+    corrected = job.force_pitch_correction or needs_correction(ref_f0, job.target_f0, job.threshold_cents)
     if corrected:
         if f0 is None:
             f0, t = pyworld.dio(x, SR, frame_period=FRAME_PERIOD, f0_floor=60.0, f0_ceil=1100.0)
@@ -224,7 +228,10 @@ def render_note(job: NoteJob) -> tuple[int, np.ndarray, float, bool, float]:
         new_f0 = f0.copy()
         voiced = f0 > 0
         # Keep (1 - flatten) of the natural contour around the target pitch.
-        new_f0[voiced] = job.target_f0 * (f0[voiced] / ref_f0) ** (1.0 - job.flatten)
+        if np.isfinite(ref_f0):
+            new_f0[voiced] = job.target_f0 * (f0[voiced] / ref_f0) ** (1.0 - job.flatten)
+        else:
+            new_f0[voiced] = job.target_f0
         y = pyworld.synthesize(new_f0, sp, ap, SR, frame_period=FRAME_PERIOD)
     else:
         y = x
@@ -264,6 +271,21 @@ def render_voice(jobs: list[NoteJob], total_sec: float,
             end = min(out.size, start + y.size)
             out[start:end] += y[: end - start]
     return out, info
+
+
+def render_melody_synth_voice(jobs: list[tuple[NoteJob | None, NoteJob]], total_sec: float,
+                              workers: int | None = None
+                              ) -> tuple[np.ndarray, list[tuple[float, bool, float]]]:
+    """Render raw consonant attacks and their pitched vowel cores as one MIDI note each."""
+    flat: list[NoteJob] = []
+    vowel_positions: list[int] = []
+    for attack, vowel in jobs:
+        if attack is not None:
+            flat.append(attack)
+        vowel_positions.append(len(flat))
+        flat.append(vowel)
+    audio, info = render_voice(flat, total_sec, workers)
+    return audio, [info[i] for i in vowel_positions]
 
 
 def sum_tracks(tracks: list[np.ndarray]) -> np.ndarray:

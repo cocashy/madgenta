@@ -9,8 +9,12 @@ from pathlib import Path
 
 def _add_render_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--melody", type=Path,
-                   help="MIDI (.mid): rendered in melody mode, phonemes ignored. With --ust, the accompaniment "
+                   help="MIDI (.mid): rendered in melody mode. With --ust, use this for accompaniment "
                         "(leave the sung tracks out of it)")
+    p.add_argument("--melody-synth", action="store_true",
+                   help="MIDI melody tracks: choose sustained vowel material from the phoneme corpus, "
+                        "keep a short consonant onset, and flatten each vowel to the note pitch "
+                        "(needs `build-corpus --phonemes wav2vec2`; auto runs it automatically)")
     p.add_argument("--ust", type=Path,
                    help="UTAU .ust / OpenUtau .ustx: the sung tracks, rendered in lyrics mode "
                         "(needs `build-corpus --phonemes wav2vec2`)")
@@ -51,9 +55,9 @@ def _add_render_args(p: argparse.ArgumentParser) -> None:
                         "longest-sounding); other tracks fill in while it rests")
     p.add_argument("--pitch-threshold", type=float, default=25.0, metavar="CENTS",
                    help="melody mode: correct a note's pitch only when the material is off by more than this "
-                        "(default 25 cents; 0 = always correct)")
+                        "(default 25 cents; 0 = always correct; --melody-synth always corrects)")
     p.add_argument("--no-pitch-correct", action="store_true",
-                   help="never pitch-correct: use the material as is (matching then favours exact pitch)")
+                   help="never pitch-correct: use the material as is (incompatible with --melody-synth)")
     p.add_argument("--lyrics-pitch-threshold", type=float, default=0.0, metavar="CENTS",
                    help="lyrics mode: the same for sung vowels (default 0 = always put them on the note's pitch)")
     p.add_argument("--lyrics-pitch-flatten", type=float, default=1.0,
@@ -85,7 +89,7 @@ def _add_render_args(p: argparse.ArgumentParser) -> None:
                         "e.g. --gain Bass=-3 --gain ust0=+2")
     p.add_argument("--pitch-flatten", type=float, default=0.6,
                    help="melody mode, corrected notes: 0 = keep the source's natural pitch contour, "
-                        "1 = flat on the note pitch")
+                        "1 = flat on the note pitch (--melody-synth always uses 1)")
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--log", type=Path, default=None,
                    help="live progress log (default: <out-dir>/render.log or <out>.log)")
@@ -173,10 +177,16 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
+    if getattr(args, "melody_synth", False) and getattr(args, "melody", None) is None:
+        raise SystemExit("--melody-synth requires --melody")
+    if getattr(args, "melody_synth", False) and getattr(args, "no_pitch_correct", False):
+        raise SystemExit("--melody-synth always corrects vowel pitch; omit --no-pitch-correct")
     if args.command in ("build-corpus", "auto"):
         from .corpus import build_corpus
-        # `auto` with a UST needs phonemes, so it asks for them itself.
-        phonemes = getattr(args, "phonemes", None) or ("wav2vec2" if getattr(args, "ust", None) else "none")
+        # `auto` with UST or melody synth needs phonemes, so it asks for them itself.
+        phonemes = getattr(args, "phonemes", None) or (
+            "wav2vec2" if (getattr(args, "ust", None) or getattr(args, "melody_synth", False)) else "none"
+        )
         build_corpus(args.source, args.db, workers=args.workers, phonemes=phonemes,
                      device=getattr(args, "device", "auto"),
                      whisper_model=getattr(args, "whisper_model", "large-v3"))
