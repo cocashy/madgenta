@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from . import db, ffmpeg, filters
+from . import auto_mix, db, ffmpeg, filters
 from .match import (
     CostWeights,
     LyricsWeights,
@@ -128,12 +128,15 @@ def _parse_track_gains(specs: list[str] | None) -> list[tuple[str, float]]:
     return out
 
 
-def _apply_gains(rendered: list[RenderedVoice], args: argparse.Namespace) -> None:
+def _apply_gains(rendered: list[RenderedVoice], args: argparse.Namespace,
+                 auto_gains: dict[tuple[str, int], float] | None = None) -> None:
     """Volume: automatic vocal/accompaniment balance, then the group gains, then per-track gains.
     Nothing is touched when every gain is 0 dB (so melody-only renders are unchanged)."""
     factors = [0.0] * len(rendered)   # dB per voice
     sung = [i for i, r in enumerate(rendered) if r.voice.lyrics]
     backing = [i for i, r in enumerate(rendered) if not r.voice.lyrics]
+    for i, r in enumerate(rendered):
+        factors[i] += (auto_gains or {}).get(r.track_key, 0.0)
     if sung and backing and args.vocal_boost is not None:
         sung_db = active_loudness_db(sum_tracks([rendered[i].audio for i in sung]))
         backing_db = active_loudness_db(sum_tracks([rendered[i].audio for i in backing]))
@@ -571,10 +574,38 @@ def render(args: argparse.Namespace) -> None:
               f"none {ranks.count(None)} (of {len(sung)})", file=sys.stderr)
 
     progress.stage("mixing and writing audio")
-    _apply_gains(rendered, args)
+    roles = auto_mix.infer_roles(rendered) if args.auto_master else {}
+    auto_gains = auto_mix.balance_gains(rendered, roles) if args.auto_master else {}
+    if args.auto_master:
+        role_summary = ", ".join(
+            f"{key[0]}{key[1]}:{next(r.voice.track_name for r in rendered if r.track_key == key)}={role}"
+            for key, role in roles.items()
+        )
+        msg = f"auto-master roles: {role_summary}"
+        print(f"  {msg}", file=sys.stderr)
+        progress.log(msg)
+    _apply_gains(rendered, args, auto_gains)
+    if args.auto_master:
+        auto_mix.apply_track_eq(rendered, roles, SR)
     _apply_filters(rendered, args.filter)
+    if args.auto_master:
+        auto_mix.apply_track_dynamics(rendered, roles, SR)
     mix = sum_tracks([r.audio for r in rendered])
-    gain = normalize_gain(mix)
+    if args.auto_master:
+        envelope = auto_mix.master_compressor_envelope(mix, SR)
+        for r in rendered:
+            r.audio = auto_mix.apply_envelope(r.audio, envelope)
+        mix = sum_tracks([r.audio for r in rendered])
+        envelope = auto_mix.limiter_envelope(mix, SR)
+        for r in rendered:
+            r.audio = auto_mix.apply_envelope(r.audio, envelope)
+        mix = sum_tracks([r.audio for r in rendered])
+        gain, active_db = auto_mix.output_gain(mix, SR)
+        msg = f"auto-master: active level {active_db:.1f} dBFS, output gain {20 * np.log10(gain):+.1f} dB"
+        print(f"  {msg}", file=sys.stderr)
+        progress.log(msg)
+    else:
+        gain = normalize_gain(mix)
     mix_wav.parent.mkdir(parents=True, exist_ok=True)
     sf.write(mix_wav, mix * gain, SR, subtype="PCM_16")
     print(f"  wrote {mix_wav}", file=sys.stderr)
