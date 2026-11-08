@@ -70,6 +70,8 @@ def _add_render_args(p: argparse.ArgumentParser) -> None:
                         "accompaniment, by measured loudness (default 2)")
     p.add_argument("--no-auto-balance", dest="vocal_boost", action="store_const", const=None,
                    help="do not balance vocals against the accompaniment automatically")
+    p.add_argument("--auto-master", "--auto-mix", dest="auto_master", action="store_true",
+                   help="automatically balance tracks, apply role-aware EQ/dynamics/room reverb, and master the mix")
     p.add_argument("--ust-gain", type=float, default=0.0, metavar="DB", help="gain for all UST tracks (dB)")
     p.add_argument("--melody-gain", type=float, default=0.0, metavar="DB", help="gain for all MIDI tracks (dB)")
     p.add_argument("--percussion", choices=["samples", "pitched", "off"], default="samples",

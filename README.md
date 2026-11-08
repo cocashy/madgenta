@@ -167,6 +167,7 @@ uv run --extra lyrics --extra cpu madgen build-corpus --source sources/ --db wor
 | `--no-lyrics-stretch` | オフ | 歌詞モードで、母音の芯を取り出してノートの長さに合わせる処理をせず、素材をそのまま使う（ノートより短ければ残りは無音） |
 | `--vocal-boost DB` | 2 | `--ust` と `--melody` の併用時、歌トラック全体を伴奏よりこの dB だけ大きくそろえる |
 | `--no-auto-balance` | オフ | 上の自動調整をしない |
+| `--auto-master`（別名 `--auto-mix`） | オフ | トラックの音量・EQ・コンプ・リバーブを自動調整し、マスター圧縮・リミッター・音量調整まで行う |
 | `--ust-gain DB` / `--melody-gain DB` | 0 | UST（歌）全体 / MIDI（伴奏）全体の音量 |
 | `--gain TRACK=DB` | — | トラックごとの音量（複数指定可）。トラック名、MIDI の番号、UST は `ust0` |
 | `--filter TRACK=SPEC` | — | トラックごとのフィルタ・EQ（複数指定可）。`all=SPEC` で全トラック |
@@ -323,12 +324,24 @@ uv run madgen render ... --filter Bass=lp:800 --filter Standard=hp:2000 --filter
 
 ## 音量調節
 
-順に、自動の歌/伴奏バランス（`--vocal-boost`）→ グループの音量（`--ust-gain` / `--melody-gain`）→ トラックごとの音量（`--gain`）をかけてからミックスし、全体のピークを -1 dBFS にそろえます。音量は鳴っている部分だけで測ります。
+通常は、自動の歌/伴奏バランス（`--vocal-boost`）→ グループの音量（`--ust-gain` / `--melody-gain`）→ トラックごとの音量（`--gain`）をかけてからミックスし、全体のサンプルピークを -1 dBFS にそろえます。
 
 ```sh
 # 歌をもっと前に出して、ベースを少し下げ、リードをさらに上げる
 uv run madgen render ... --vocal-boost 9 --gain Bass=-3 --gain ust0=+2
 ```
+
+## 自動MIX・マスタリング
+
+`--auto-master` を指定すると、トラック名、UST/打楽器の種別、音域から役割を推定して、トラックごとの音量とEQを調整します。さらに、役割に応じた軽いコンプレッサーとルームリバーブを加え、全体のバス圧縮・ピーク制御を行います。最後に鳴っている区間のRMSを目標に音量を整え、サンプルピークを -1 dBFS 以下に保ちます。
+
+```sh
+uv run madgen render ... --auto-master
+```
+
+`--auto-mix` は同じ機能の別名です。`--gain` / `--ust-gain` / `--melody-gain` は自動の役割別音量調整に加算され、`--filter` は自動EQの後に適用されます。どちらの指定も `--auto-master` と併用できます。`--no-auto-balance` を付けると歌と伴奏のグループ間バランスだけを無効にし、役割別の自動調整は続けます。
+
+音量の解析はLUFSではなく、無音区間を除いたブロックRMSを使います。マスター処理の制御カーブは各パートにも共通で適用するため、`--split-parts` のパートを足すと `mix.wav` に戻ります。
 
 ## 無音の扱い
 
